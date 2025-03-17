@@ -1,0 +1,1561 @@
+---
+title: "Project STA 141 by Robert Zhu"
+output: html_document
+date: "2025-03-13"
+css: style.css 
+---
+<style>
+  /* Default styling for all normal text */
+  body {
+    font-size: 16pt;
+    font-family: "Arial", sans-serif;
+    line-height: 1.6;
+  }
+  /* Default styling for all headings (subtitles like Background, Abstract, etc.) */
+  h1, h2, h3, h4, h5, h6 {
+    font-family: "Helvetica", sans-serif;
+    font-weight: bold;
+    margin-top: 1.2em;
+    margin-bottom: 0.5em;
+  }
+</style>
+
+```{r setup, include=FALSE}
+library(tidyverse)  # For data manipulation and visualization
+library(ggplot2)    # For creating plots
+library(dplyr)      # For data manipulation
+library(tidyr)      # For data tidying
+library(purrr)      # For functional programming
+library(knitr)      # For creating tables
+library(kableExtra) # For enhanced tables
+library(caret)      
+library(glmnet)
+library(ROCR)
+library(randomForest)
+library(pROC)
+library(xgboost)
+library(gganimate)
+library(gifski)
+library(av)
+library(magick)
+library(multcompView)
+library(ranger)
+library(parsnip)
+knitr::opts_chunk$set(echo = FALSE)
+```
+
+Background
+
+In this project, we analyze a subset of data collected by Steinmetz et al. (2019).
+In the study conducted by Steinmetz et al. (2019), experiments were performed on a total of 10 mice over 39 sessions. Each session comprised several hundred trials, during which visual stimuli were randomly presented to the mouse on two screens positioned on both sides of it. The stimuli varied in terms of contrast levels, which took values in {0, 0.25, 0.5, 1}, with 0 indicating the absence of a stimulus. The mice were required to make decisions based on the visual stimuli, using a wheel controlled by their forepaws. A reward or penalty (i.e., feedback) was subsequently administered based on the outcome of their decisions. In particular,
+
+When left contrast > right contrast, success (1) if turning the wheel to the right and failure (-1) otherwise.
+When right contrast > left contrast, success (1) if turning the wheel to the left and failure (-1) otherwise.
+When both left and right contrasts are zero, success (1) if holding the wheel still and failure (-1) otherwise.
+When left and right contrasts are equal but non-zero, left or right will be randomly chosen (50%) as the correct choice.
+The activity of the neurons in the mice’s visual cortex was recorded during the trials and made available in the form of spike trains, which are collections of timestamps corresponding to neuron firing. In this project, we focus specifically on the spike trains of neurons from the onset of the stimuli to 0.4 seconds post-onset.
+
+Abstract
+In this project, I analyze the dataset and did some exploratory data analysis. I first loaded the data and checked the basic information of the dataset. And I did my best to provide some necessary plots. After that I trained the data and model. I compared 3 prediction models including logistic regression, random forest, and xgboost Ensemble. I found that the random forest model has the highest accuracy and sensitivity. In the end, I tested my model on 2 test datasets, and as expected it performs better than the other 2. 
+
+
+```{r,echo = FALSE}
+
+
+#load data
+path <- "C:/Users/windows/Documents/STA/STA141 project/session"
+session <- vector("list", 18)
+for (i in 1:18) {
+  file_path <- file.path(path, paste0("session", i, ".rds"))
+  session[[i]] <- readRDS(file_path)
+  cat("Session", i, "- Mouse:", session[[i]]$mouse_name, ", Date:", session[[i]]$date_exp, "\n")
+}
+session_summary <- data.frame(
+  session_id = 1:18,
+  mouse_name = sapply(session, function(x) x$mouse_name),
+  date = sapply(session, function(x) x$date_exp),
+  n_trials = sapply(session, function(x) length(x$feedback_type)),
+  n_neurons = sapply(session, function(x) dim(x$spks[[1]])[1]),
+  n_brain_areas = sapply(session, function(x) length(unique(x$brain_area))),
+  success_rate = sapply(session, function(x) mean(x$feedback_type == 1))
+)
+```
+loaded with 18 session
+Five variables are available for each trial, namely
+```{r}
+names(session[[18]])
+
+```
+contrast_left: contrast of the left stimulus
+contrast_right: contrast of the right stimulus
+feedback_type: type of the feedback, 1 for success and -1 for failure
+spks: numbers of spikes of neurons in the visual cortex in time bins defined in time
+brain_area: area of the brain where each neuron lives
+time: centers of the time bins for spks
+spks: numbers of spikes of neurons in the visual cortex in time bins defined in time
+mouse_name: name of the 4 mice
+```{r,echo = FALSE}
+# Function to extract basic session information
+extract_session_info <- function(session_list) {
+  n_sessions <- length(session_list)
+  
+  # Create data frame to store session information
+  session_info <- data.frame(
+    session_id = 1:n_sessions,
+    mouse_name = character(n_sessions),
+    date_exp = character(n_sessions),
+    n_trials = numeric(n_sessions),
+    n_neurons = numeric(n_sessions),
+    success_rate = numeric(n_sessions),
+    stringsAsFactors = FALSE
+  )
+  
+  for (i in 1:n_sessions) {
+    session_info$mouse_name[i] <- session_list[[i]]$mouse_name
+    session_info$date_exp[i] <- session_list[[i]]$date_exp
+    session_info$n_trials[i] <- length(session_list[[i]]$feedback_type)
+    session_info$n_neurons[i] <- length(session_list[[i]]$brain_area)
+    session_info$success_rate[i] <- sum(session_list[[i]]$feedback_type == 1) / 
+                                   length(session_list[[i]]$feedback_type)
+  }
+  
+  return(session_info)
+}
+
+# Get session information
+session_info <- extract_session_info(session)
+
+
+
+```
+
+```{r,include=FALSE}
+# Calculate average success rate by mouse
+mouse_success_rates <- session_info %>%
+  group_by(mouse_name) %>%
+  summarize(
+    avg_success_rate = mean(success_rate),
+    n_sessions = n()
+  )
+
+# Create the plot
+ggplot(mouse_success_rates, aes(x = mouse_name, y = avg_success_rate, fill = mouse_name)) +
+  geom_bar(stat = "identity", width = 0.6) +
+  labs(title = "Average Success Rate by Mouse",
+       x = "Mouse",
+       y = "Average Success Rate") +
+  theme_minimal() +
+  geom_hline(yintercept = mean(session_info$success_rate), linetype = "dashed", color = "red") +
+  geom_text(aes(label = paste0(round(avg_success_rate*100, 1), "%")), 
+            position = position_stack(vjust = 0.5), color = "white") +
+  geom_text(aes(label = paste(n_sessions, "sessions")), 
+            position = position_stack(vjust = 0.9), color = "white", size = 3) +
+  theme(legend.position = "none")
+
+
+```
+				In Average success rate by mouse, the average success rate of each mouse is calculated and shown in the plot. 
+```{r,echo = FALSE}
+contrast_data <- data.frame()
+
+for (i in 1:18) {
+  temp <- data.frame(
+    session = i,
+    mouse = session[[i]]$mouse_name,
+    contrast_left = session[[i]]$contrast_left,
+    contrast_right = session[[i]]$contrast_right,
+    feedback = session[[i]]$feedback_type
+  )
+  contrast_data <- rbind(contrast_data, temp)
+}
+
+# Create a function to categorize decision types
+contrast_data <- contrast_data %>%
+  mutate(decision_type = case_when(
+    contrast_left > contrast_right ~ "left_greater",
+    contrast_left < contrast_right ~ "right_greater",
+    contrast_left == 0 & contrast_right == 0 ~ "both_zero",
+    TRUE ~ "equal_nonzero"
+  ))
+
+# Visualize decision types and success rates
+ggplot(contrast_data, aes(x = decision_type, fill = factor(feedback, levels = c(-1, 1), labels = c("Failure", "Success")))) +
+  geom_bar(position = "fill") +
+  labs(title = "Success Rates by Decision Type",
+       x = "Decision Type",
+       y = "Proportion",
+       fill = "Outcome") +
+  theme_minimal() +
+  scale_fill_manual(values = c("Failure" = "#FF6B6B", "Success" = "#4ECDC4"))
+
+# 1.2 Neural activity analysis - examine average spike rates across sessions
+avg_spikes_by_session <- map_dfr(seq_along(session), function(i) {
+  n_trials <- length(session[[i]]$feedback_type)
+  map_dfr(seq_len(n_trials), function(j) {
+    spk_data <- session[[i]]$spks[[j]]
+    avg_spikes <- mean(rowSums(spk_data))
+    data.frame(
+      session = i,
+      mouse = session[[i]]$mouse_name,
+      trial = j,
+      avg_spikes = avg_spikes,
+      feedback = factor(session[[i]]$feedback_type[j],
+                        levels = c(-1, 1),
+                        labels = c("Failure", "Success"))
+    )
+  })
+})
+ggplot(avg_spikes_by_session, aes(x = avg_spikes, fill = feedback)) +
+  geom_density(alpha = 0.7) +
+  facet_wrap(~ mouse) +
+  labs(title = "Distribution of Average Spikes by Mouse and Outcome",
+       x = "Average Spikes per Neuron",
+       y = "Density",
+       fill = "Trial Outcome") +
+  theme_minimal() +
+  scale_fill_manual(values = c("Failure" = "#FF6B6B", "Success" = "#4ECDC4"))
+# Plot the distribution of average spikes by outcome
+avg_spikes_by_session_anim <- avg_spikes_by_session %>%
+  mutate(trial = as.factor(trial),
+         session = as.factor(session))  # Ensure session is a factor for animation
+
+anim_plot <- ggplot(avg_spikes_by_session_anim, aes(x = avg_spikes, fill = feedback)) +
+  geom_density(alpha = 0.7) +
+  facet_wrap(~ mouse) +
+  labs(title = 'Session: {closest_state}', 
+       x = "Average Spikes per Neuron", 
+       y = "Density", 
+       fill = "Trial Outcome") +
+  theme_minimal() +
+  scale_fill_manual(values = c("Failure" = "#FF6B6B", "Success" = "#4ECDC4")) +
+  transition_states(session, transition_length = 2, state_length = 1, wrap = FALSE) +
+  ease_aes('linear')
+
+animate(anim_plot)
+
+
+
+
+```
+     In success rate by decision type, turning left and right has the highest success rate. Equal_nonezero represents the lowest at 50%. This is because "When left and right contrasts are equal but non-zero, left or right will be randomly chosen (50%) as the correct choice."
+     In Distribution of Average Spikes by Mouse and Outcome, the distribution of average spikes per neuron is shown for each mouse, with the density of spikes colored by the outcome of the trial (success or failure). The plot provides insights into the neural activity patterns associated with different outcomes.
+
+```{r,echo = FALSE,results='hide'}
+# 1.3 Analyze neural activity by brain area
+
+# Analyze areas for a sample session (e.g., session 1)
+#session_id <- 1
+#area_activity <- analyze_brain_areas(session_id)   
+analyze_brain_areas <- function(session_id) {
+  # Extract data for the session
+  brain_areas <- unique(session[[session_id]]$brain_area)
+  n_trials <- length(session[[session_id]]$feedback_type)
+  
+  # Initialize data frame for results
+  area_activity <- data.frame()
+  
+  for (trial in 1:n_trials) {
+    spks <- session[[session_id]]$spks[[trial]]
+    
+    # Calculate average spikes per neuron by brain area
+    for (area in brain_areas) {
+      area_neurons <- which(session[[session_id]]$brain_area == area)
+      if (length(area_neurons) > 0) {
+        area_spks <- spks[area_neurons,]
+        avg_area_spikes <- mean(apply(area_spks, 1, sum))
+        
+        area_activity <- rbind(area_activity, data.frame(
+          brain_area = area,
+          trial = trial,
+          feedback = factor(session[[session_id]]$feedback_type[trial], 
+                           levels = c(-1, 1), 
+                           labels = c("Failure", "Success")),
+          avg_spikes = avg_area_spikes
+        ))
+      }
+    }
+  }
+  
+  return(area_activity)
+} 
+
+
+area_activity_all <- map_dfr(seq_along(session), analyze_brain_areas)
+area_summary <- area_activity_all %>%
+  group_by(brain_area) %>%
+  summarize(
+    mean_spikes = mean(avg_spikes),
+    sd_spikes   = sd(avg_spikes),
+    n           = n(),
+    se_spikes   = sd_spikes / sqrt(n),
+    .groups     = "drop"
+  )
+
+
+# 1. One-way ANOVA
+res_aov <- aov(avg_spikes ~ brain_area, data = area_activity_all)
+summary(res_aov)
+
+# 2. Tukey’s HSD for pairwise comparisons
+tukey_res <- TukeyHSD(res_aov, "brain_area", conf.level = 0.95)
+tukey_res
+
+
+# This creates a named vector of letters
+letters <- multcompLetters(tukey_res$brain_area[, "p adj"])
+
+# Convert the result to a data frame with a column named "group"
+letters_df <- data.frame(
+  brain_area = names(letters$Letters),
+  group = letters$Letters,
+  row.names = NULL
+)
+
+# Merge the letter assignments into your summary table
+area_summary <- left_join(area_summary, letters_df, by = "brain_area")
+
+
+# Merge the letter assignments into our summary table
+area_summary_top10 <- area_summary %>%
+  arrange(desc(mean_spikes)) %>%
+  dplyr::slice(1:10)
+
+brain_areas_ordered <- area_activity_all %>%
+  group_by(brain_area) %>%
+  summarize(median_spikes = median(avg_spikes), .groups = "drop") %>%
+  arrange(desc(median_spikes)) %>%
+  pull(brain_area)
+
+# Determine how many areas to include in each plot
+n_areas <- length(brain_areas_ordered)
+areas_per_plot <- ceiling(n_areas / 4)
+
+# Create 4 groups of brain areas
+brain_area_groups <- list(
+  brain_areas_ordered[1:min(areas_per_plot, n_areas)],
+  brain_areas_ordered[(areas_per_plot + 1):min(2*areas_per_plot, n_areas)],
+  brain_areas_ordered[(2*areas_per_plot + 1):min(3*areas_per_plot, n_areas)],
+  brain_areas_ordered[(3*areas_per_plot + 1):min(4*areas_per_plot, n_areas)]
+)
+```
+```{r,echo = FALSE}
+# Remove any NULL elements (in case there are fewer than 4*areas_per_plot areas)
+brain_area_groups <- brain_area_groups[sapply(brain_area_groups, length) > 0]
+
+# Create a list to store the plots
+area_plots <- list()
+
+# Create a plot for each group of brain areas
+for (i in seq_along(brain_area_groups)) {
+  # Filter data for the current group of brain areas
+  group_data <- area_activity_all %>%
+    filter(brain_area %in% brain_area_groups[[i]])
+  
+  # Create the plot
+  area_plots[[i]] <- ggplot(group_data, 
+         aes(x = reorder(brain_area, avg_spikes, FUN = median), 
+             y = avg_spikes, fill = feedback)) +
+    geom_boxplot() +
+    labs(title = paste("Neural Activity by Brain Area (Group", i, ")"),
+         x = "Brain Area",
+         y = "Average Spikes per Neuron",
+         fill = "Outcome") +
+    theme_minimal() +
+    theme(axis.text.x = element_text(angle = 45, hjust = 1)) +
+    scale_fill_manual(values = c("Failure" = "#FF6B6B", "Success" = "#4ECDC4"))
+}
+
+# Display each plot
+for (plot in area_plots) {
+  print(plot)
+}
+
+
+# Plot brain area activity
+
+
+
+```
+					In Neural Activity by Brain Area, the box-plots show the distribution of average spikes per neuron for each brain area, grouped by the outcome of the trial (success or failure). The original plot cluster all area into one plot, and now it is divided into 4 parts so it is easier to see. 
+```{r,echo = FALSE}
+
+
+# Now plot the top 10 brain areas
+ggplot(area_summary_top10, 
+       aes(x = reorder(brain_area, mean_spikes), y = mean_spikes)) +
+  geom_col(fill = "skyblue") +
+  geom_errorbar(aes(ymin = mean_spikes - se_spikes, 
+                    ymax = mean_spikes + se_spikes),
+                width = 0.2) +
+  geom_text(aes(label = group, 
+                y = mean_spikes + se_spikes + 0.1),
+            color = "red", size = 4) +
+  coord_flip() +
+  labs(title = "Top 10 Brain Areas by Mean Spikes per Neuron",
+       x = "Brain Area (sorted by mean spikes)",
+       y = "Mean Average Spikes per Neuron",
+       subtitle = "Significance groups from Tukey HSD") +
+  theme_minimal()
+
+```
+In Top 10 Brain Areas by Mean Spikes per Neuron, the top 10 brain areas with the highest mean average spikes are shown in a bar plot. The red letters indicate significant differences between groups based on Tukey's HSD test.
+
+
+
+```{r,echo = FALSE}
+# 2. Data Integration
+
+# 2.1 Create a function to extract features from each trial
+extract_trial_features <- function(session_id, trial_id) {
+  sess <- session[[session_id]]
+  
+  trial_data <- list(
+    session_id    = session_id,
+    mouse_name    = sess$mouse_name,
+    contrast_left = sess$contrast_left[trial_id],
+    contrast_right= sess$contrast_right[trial_id],
+    feedback      = sess$feedback_type[trial_id]
+  )
+  
+  # Decision type
+  if (sess$contrast_left[trial_id] > sess$contrast_right[trial_id]) {
+    trial_data$decision_type <- "left_greater"
+  } else if (sess$contrast_left[trial_id] < sess$contrast_right[trial_id]) {
+    trial_data$decision_type <- "right_greater"
+  } else if (sess$contrast_left[trial_id] == 0 && sess$contrast_right[trial_id] == 0) {
+    trial_data$decision_type <- "both_zero"
+  } else {
+    trial_data$decision_type <- "equal_nonzero"
+  }
+  
+  # Neural activity features
+  spks_trial <- sess$spks[[trial_id]]
+  time_bins <- sess$time[[trial_id]]
+  
+  # Overall activity using rowSums for faster computation
+  trial_data$avg_spikes <- mean(rowSums(spks_trial))
+  
+  # Early vs. late response (assuming time bins are ordered)
+  if (length(time_bins) >= 2) {
+    mid_time   <- 0.1  # 100ms cutoff point
+    early_bins <- time_bins <= mid_time
+    late_bins  <- time_bins > mid_time
+    
+    if (any(early_bins) && any(late_bins)) {
+      early_spks <- spks_trial[, early_bins, drop = FALSE]
+      late_spks  <- spks_trial[, late_bins, drop = FALSE]
+      
+      trial_data$early_response <- mean(rowSums(early_spks))
+      trial_data$late_response  <- mean(rowSums(late_spks))
+      trial_data$response_ratio <- ifelse(trial_data$late_response > 0,
+                                           trial_data$early_response / trial_data$late_response, 0)
+    }
+  }
+  
+  # Brain area activity using sapply to avoid an explicit loop
+  brain_areas <- unique(sess$brain_area)
+  brain_area_features <- sapply(brain_areas, function(area) {
+    area_neurons <- which(sess$brain_area == area)
+    if (length(area_neurons) > 0) {
+      area_spks <- spks_trial[area_neurons, , drop = FALSE]
+      mean(rowSums(area_spks))
+    } else {
+      NA
+    }
+  })
+  
+  # Append brain area features to trial_data with a dynamic naming scheme
+  for (area in names(brain_area_features)) {
+    trial_data[[paste0("area_", area)]] <- brain_area_features[[area]]
+  }
+  
+  return(as.data.frame(trial_data))
+}
+integrated_data <- map_dfr(seq_along(session), function(i) {
+  n_trials <- length(session[[i]]$feedback_type)
+  map_dfr(seq_len(n_trials), function(j) {
+    extract_trial_features(i, j)
+  })
+})
+
+# Convert categorical variables to factors
+integrated_data$decision_type <- as.factor(integrated_data$decision_type)
+integrated_data$mouse_name <- as.factor(integrated_data$mouse_name)
+integrated_data$feedback <- factor(integrated_data$feedback, levels = c(-1, 1), labels = c("Failure", "Success"))
+```
+
+```{r,echo = FALSE,results='hide'}
+# 2.3 Normalize features by session to account for session differences
+normalize_by_session <- function(data, feature_cols) {
+  data %>%
+    group_by(session_id) %>%
+    mutate(across(all_of(feature_cols),
+                  ~ {
+                    col_mean <- mean(., na.rm = TRUE)
+                    col_sd <- sd(., na.rm = TRUE)
+                    if (!is.na(col_sd) && col_sd > 0) {
+                      (. - col_mean) / col_sd
+                    } else {
+                      NA_real_
+                    }
+                  },
+                  .names = "{.col}_norm")) %>%
+    ungroup()
+}
+# Identify numeric columns for normalization (excluding certain columns)
+numeric_cols <- names(integrated_data)[sapply(integrated_data, is.numeric)]
+numeric_cols <- numeric_cols[!numeric_cols %in% c("session_id", "feedback")]
+
+# Normalize features
+normalized_data <- normalize_by_session(integrated_data, numeric_cols)
+
+
+
+
+```
+
+```{r,echo = FALSE}
+# Check the distribution of feedback values in your data
+  model_data <- normalized_data %>%
+    select(feedback, decision_type, contains("_norm")) %>%
+    na.omit()
+
+
+
+table(model_data$feedback)
+
+# If there's only one level, we need to investigate why
+# First, check the original data before NA removal
+table(normalized_data$feedback)
+
+# Look at what's happening during data filtering
+# Check if too many rows were removed by na.omit()
+cat("Rows in normalized_data:", nrow(normalized_data), "\n")
+cat("Rows in model_data after na.omit():", nrow(model_data), "\n")
+```
+```{r,echo = FALSE,results='hide'}
+# Check which columns have NAs that might be causing the issue
+na_counts <- sapply(normalized_data, function(x) sum(is.na(x)))
+print(na_counts[na_counts > 0])
+```
+
+```{r,echo = FALSE,result='hide'}
+
+
+# First, identify columns with fewer NAs
+na_proportions <- sapply(normalized_data, function(x) {
+  sum(is.na(x)) / nrow(normalized_data)
+})
+
+# Filter for columns with less than 50% NAs (adjust threshold as needed)
+usable_columns <- names(na_proportions[na_proportions < 0.5])
+cat("Columns with less than 50% NA values:\n")
+print(usable_columns)
+
+# Create model data with only the essential columns and usable features
+model_data <- normalized_data %>%
+  select(feedback, decision_type, contrast_left, contrast_right, 
+         all_of(usable_columns)) %>%
+  # Only remove rows where essential columns have NA values
+  filter(!is.na(feedback) & !is.na(decision_type) & 
+         !is.na(contrast_left) & !is.na(contrast_right))
+
+# Check how many rows we have now
+cat("Rows in model_data after selective filtering:", nrow(model_data), "\n")
+
+# Check feedback distribution
+table(model_data$feedback)
+
+
+  # Convert categorical variables
+  integrated_data <- integrated_data %>%
+    mutate(
+      decision_type = as.factor(decision_type),
+      mouse_name = as.factor(mouse_name),
+      feedback = factor(feedback, levels = c(-1, 1), labels = c("Failure", "Success"))
+    )
+  
+  # Normalize by session
+  numeric_cols <- names(integrated_data)[sapply(integrated_data, is.numeric)]
+  numeric_cols <- numeric_cols[!numeric_cols %in% c("session_id", "feedback")]
+  
+  normalized_data <- integrated_data %>%
+    group_by(session_id) %>%
+    mutate(across(all_of(numeric_cols), 
+                  list(norm = ~(.x - mean(.x, na.rm = TRUE)) / 
+                         (sd(.x, na.rm = TRUE) + 1e-10)),
+                  .names = "{.col}_{.fn}")) %>%
+    ungroup()
+  
+  # Create model data
+  model_data <- normalized_data %>%
+    select(feedback, decision_type, contains("_norm")) %>%
+    na.omit()
+
+
+# Now check if we have enough data with both classes
+cat("Final model_data rows:", nrow(model_data), "\n")
+print(table(model_data$feedback))
+
+# If we now have adequate data with both classes, proceed with splitting
+if(length(unique(model_data$feedback)) >= 2 && 
+   all(table(model_data$feedback) > 10)) {  # Ensure at least 10 samples per class
+  
+  set.seed(95616)  # For reproducibility
+  train_idx <- createDataPartition(model_data$feedback, p = 0.8, list = FALSE)
+  train_data <- model_data[train_idx, ]
+  valid_data <- model_data[-train_idx, ]
+  
+  # Verify we have both classes in both train and validation sets
+  cat("Training data distribution:\n")
+  print(table(train_data$feedback))
+  
+  cat("Validation data distribution:\n")
+  print(table(valid_data$feedback))
+    # Proceed with modeling
+  log_model <- glm(feedback ~ ., data = train_data, family = "binomial")
+  
+  # Print summary of the model
+  print(summary(log_model))
+  
+  # Make predictions and evaluate
+  valid_pred <- predict(log_model, valid_data, type = "response")
+  valid_class <- ifelse(valid_pred > 0.5, "Success", "Failure")
+  
+  # Confusion matrix
+  conf_matrix <- confusionMatrix(factor(valid_class), valid_data$feedback)
+  print(conf_matrix)
+}
+
+
+```
+	
+```{r}
+create_model_ready_data <- function(session_list) {
+  
+  # Iterate over sessions using imap_dfr (index + element) to combine rows
+  all_trials <- imap_dfr(session_list, function(sess, session_id) {
+    # Iterate over trials for each session
+    imap_dfr(sess$feedback_type, function(feedback, trial_id) {
+      # Create a tibble with basic trial information
+      trial <- tibble(
+        session_id   = session_id,
+        trial_id     = trial_id,
+        mouse_name   = sess$mouse_name,
+        contrast_left  = sess$contrast_left[trial_id],
+        contrast_right = sess$contrast_right[trial_id],
+        feedback     = feedback,
+        decision_type = case_when(
+          sess$contrast_left[trial_id] > sess$contrast_right[trial_id] ~ "left_greater",
+          sess$contrast_left[trial_id] < sess$contrast_right[trial_id] ~ "right_greater",
+          sess$contrast_left[trial_id] == 0 & sess$contrast_right[trial_id] == 0 ~ "both_zero",
+          TRUE ~ "equal_nonzero"
+        )
+      )
+      
+      # Compute basic spike statistics (not dependent on brain areas)
+      spks_trial  <- sess$spks[[trial_id]]
+      total_spikes <- rowSums(spks_trial)
+      trial <- trial %>%
+        mutate(
+          avg_spikes  = mean(total_spikes),
+          med_spikes  = median(total_spikes),
+          max_spikes  = max(total_spikes),
+          spike_var   = var(total_spikes)
+        )
+      
+      # Compute time-based features if time bins are available
+      time_bins <- sess$time[[trial_id]]
+      if (length(time_bins) >= 2) {
+        mid_idx    <- ceiling(length(time_bins) / 2)
+        early_bins <- 1:mid_idx
+        late_bins  <- (mid_idx + 1):length(time_bins)
+        
+        early_avg <- mean(rowSums(spks_trial[, early_bins, drop = FALSE]))
+        late_avg  <- mean(rowSums(spks_trial[, late_bins, drop = FALSE]))
+        
+        trial <- trial %>%
+          mutate(
+            early_avg     = early_avg,
+            late_avg      = late_avg,
+            response_ratio = early_avg / (late_avg + 1e-10)
+          )
+      } else {
+        trial <- trial %>%
+          mutate(
+            early_avg     = NA_real_,
+            late_avg      = NA_real_,
+            response_ratio = NA_real_
+          )
+      }
+      
+      return(trial)
+    })
+  })
+  
+  # Convert appropriate columns to factors
+  all_trials <- all_trials %>%
+    mutate(
+      decision_type = as.factor(decision_type),
+      mouse_name    = as.factor(mouse_name),
+      feedback      = factor(feedback, levels = c(-1, 1), labels = c("Failure", "Success"))
+    )
+  
+  return(all_trials)
+}
+
+
+
+
+```
+
+```{r}
+
+
+# Create the processed dataset
+processed_data <- create_model_ready_data(session)
+
+# Check for missing values
+na_counts <- colSums(is.na(processed_data))
+print(na_counts[na_counts > 0])
+
+# Remove any rows with NA values to ensure clean data for modeling
+clean_data <- na.omit(processed_data)
+print(paste("Rows before NA removal:", nrow(processed_data)))
+print(paste("Rows after NA removal:", nrow(clean_data)))
+
+# Verify we have both classes
+print(table(clean_data$feedback))
+
+# Split data for training and testing
+set.seed(95616)  # For reproducibility
+train_idx <- createDataPartition(clean_data$feedback, p = 0.8, list = FALSE)
+train_data <- clean_data[train_idx, ]
+test_data <- clean_data[-train_idx, ]
+
+# Verify class distribution in both sets
+cat("Training data distribution:\n")
+print(table(train_data$feedback))
+
+cat("Testing data distribution:\n")
+print(table(test_data$feedback))
+
+# Function to evaluate models
+evaluate_model <- function(pred_probs, actual, model_name) {
+  # Convert probabilities to class predictions
+  pred_class <- ifelse(pred_probs > 0.5, "Success", "Failure")
+  pred_class <- factor(pred_class, levels = levels(actual))
+  
+  # Calculate confusion matrix
+  conf_mat <- confusionMatrix(pred_class, actual)
+  
+  # Calculate ROC and AUC
+  roc_obj <- roc(actual, pred_probs)
+  auc_val <- auc(roc_obj)
+  
+  # Store key metrics
+  metrics <- data.frame(
+    Model = model_name,
+    Accuracy = conf_mat$overall["Accuracy"],
+    Sensitivity = conf_mat$byClass["Sensitivity"],
+    Specificity = conf_mat$byClass["Specificity"],
+    F1_Score = conf_mat$byClass["F1"],
+    AUC = auc_val
+  )
+  
+  # Return results as a list
+  return(list(
+    metrics = metrics,
+    conf_matrix = conf_mat,
+    roc = roc_obj,
+    pred_probs = pred_probs,
+    pred_class = pred_class
+  ))
+}
+```
+```{r}
+# List to store results
+model_results <- list()
+
+# Remove non-predictor columns
+predictors <- names(train_data)[!names(train_data) %in% 
+                               c("session_id", "trial_id", "mouse_name", "feedback")]
+
+# Create model formula
+model_formula <- as.formula(paste("feedback ~", paste(predictors, collapse = " + ")))
+
+# 1. Logistic Regression
+log_model <- glm(model_formula, data = train_data, family = "binomial")
+log_pred <- predict(log_model, test_data, type = "response")
+log_results <- evaluate_model(log_pred, test_data$feedback, "Logistic Regression")
+model_results[["Logistic"]] <- log_results
+
+# Display accuracy metrics in a more readable format
+cat("\n===== Logistic Regression Model Performance =====\n")
+cat(sprintf("Accuracy: %.2f%%\n", log_results$metrics$Accuracy * 100))
+cat(sprintf("95%% CI: (%.2f%% - %.2f%%)\n", 
+            log_results$conf_matrix$overall["AccuracyLower"] * 100,
+            log_results$conf_matrix$overall["AccuracyUpper"] * 100))
+cat(sprintf("Sensitivity (True Positive Rate): %.2f%%\n", log_results$metrics$Sensitivity * 100))
+cat(sprintf("Specificity (True Negative Rate): %.2f%%\n", log_results$metrics$Specificity * 100))
+cat(sprintf("F1 Score: %.2f\n", log_results$metrics$F1_Score))
+cat(sprintf("AUC: %.3f\n", log_results$metrics$AUC))
+
+# Summary of logistic model
+cat("\nLogistic Regression Summary:\n")
+print(summary(log_model))
+
+```
+		
+		
+		This part I used logistic model to predict the success rate using trained data. It has an accuracy of 70.44% of accuracy(95% confident that the accuracy is between 67.53% - 73.24%. Sensitivity is 70.44% and Specificity is 70.44%. F1 score is 0.70 and AUC is 0.77. 
+		
+		
+		
+```{r}
+# 2. Random Forest
+# Convert factors to numeric for easier handling in Random Forest
+cat("\nTraining Random Forest with randomForest package...\n")
+rf_train <- train_data
+rf_test <- test_data
+rf_train$decision_type <- as.numeric(rf_train$decision_type)
+rf_test$decision_type <- as.numeric(rf_test$decision_type)
+
+# Check data dimensions to determine if we might face memory issues
+cat("Training data dimensions:", dim(rf_train), "\n")
+
+  rf_model <- randomForest(model_formula, 
+                         data = rf_train, 
+                         ntree = 200, 
+                         importance = TRUE,
+                         mtry = floor(sqrt(length(predictors))))  # Default mtry for classification
+  
+  rf_pred <- predict(rf_model, rf_test, type = "prob")[,"Success"]
+  rf_results <- evaluate_model(rf_pred, test_data$feedback, "Random Forest")
+  model_results[["RF"]] <- rf_results
+  
+  # Print RF information
+  cat("\nRandomForest Information:\n")
+  print(rf_model)
+  cat("\n===== Random Forest Model Performance =====\n")
+cat(sprintf("Accuracy: %.2f%%\n", rf_results$metrics$Accuracy * 100))
+cat(sprintf("95%% CI: (%.2f%% - %.2f%%)\n", 
+            rf_results$conf_matrix$overall["AccuracyLower"] * 100,
+            rf_results$conf_matrix$overall["AccuracyUpper"] * 100))
+cat(sprintf("Sensitivity (True Positive Rate): %.2f%%\n", rf_results$metrics$Sensitivity * 100))
+cat(sprintf("Specificity (True Negative Rate): %.2f%%\n", rf_results$metrics$Specificity * 100))
+cat(sprintf("F1 Score: %.2f\n", rf_results$metrics$F1_Score))
+cat(sprintf("AUC: %.3f\n", rf_results$metrics$AUC))
+
+```
+
+
+
+The accuracy of random forest is 74% and the sensitivity is 33.33%, a specificity of 89.04%, an F1 score of 0.41, and an AUC of 0.735.
+
+
+```{r}
+# 3. XGBoost 
+# Prepare matrices for XGBoost
+# Prepare matrices for XGBoost
+# ---- Ensemble XGBoost Implementation and Evaluation ----
+
+# 
+features <- model.matrix(~ . -1 -feedback -session_id -trial_id -mouse_name, data = train_data)
+test_features <- model.matrix(~ . -1 -feedback -session_id -trial_id -mouse_name, data = test_data)
+
+# Create DMatrix objects for XGBoost
+xgb_train <- xgb.DMatrix(data = features, 
+                         label = as.numeric(train_data$feedback) - 1)  # 0=Failure, 1=Success
+xgb_test <- xgb.DMatrix(data = test_features,
+                        label = as.numeric(test_data$feedback) - 1)
+
+# ---- EFFICIENT SEQUENTIAL PARAMETER TUNING ----
+
+# Start with default values for all parameters
+best_params <- list(
+  objective = "binary:logistic",
+  eval_metric = "logloss",
+  eta = 0.05,
+  max_depth = 6,
+  subsample = 0.8,
+  colsample_bytree = 0.8,
+  min_child_weight = 1,
+  gamma = 0
+)
+
+cat("\n==== STEP 1: Tuning Learning Rate and Tree Complexity ====\n")
+
+# Step 1: Tune learning rate and tree complexity
+param_grid1 <- expand.grid(
+  eta = c(0.01, 0.05, 0.1),
+  max_depth = c(4, 6, 8)
+)
+
+# First round of tuning
+cv_results1 <- data.frame()
+for (i in 1:nrow(param_grid1)) {
+  params <- best_params
+  params$eta <- param_grid1$eta[i]
+  params$max_depth <- param_grid1$max_depth[i]
+ 
+  
+  cv_model <- xgb.cv(
+    params = params,
+    data = xgb_train,
+    nrounds = 200,
+    nfold = 5,
+    early_stopping_rounds = 20,
+    metrics = "logloss",
+    stratified = TRUE,
+    verbose = 0
+  )
+  
+  cv_results1 <- rbind(cv_results1, data.frame(
+    eta = params$eta,
+    max_depth = params$max_depth,
+    cv_logloss = cv_model$evaluation_log[cv_model$best_iteration]$test_logloss_mean,
+    best_iter = cv_model$best_iteration
+  ))
+}
+
+# Update best parameters from first round
+best_row <- which.min(cv_results1$cv_logloss)
+best_params$eta <- cv_results1$eta[best_row]
+best_params$max_depth <- cv_results1$max_depth[best_row]
+best_iter <- cv_results1$best_iter[best_row]
+
+cat("\nBest parameters after Step 1:\n")
+print(best_params)
+cat("Best number of iterations:", best_iter, "\n")
+
+cat("\n==== STEP 2: Tuning Sampling Parameters ====\n")
+
+# Step 2: Tune sampling parameters with best learning params
+param_grid2 <- expand.grid(
+  subsample = c(0.7, 0.8, 0.9),
+  colsample_bytree = c(0.7, 0.8, 0.9)
+)
+
+# Second round of tuning
+cv_results2 <- data.frame()
+for (i in 1:nrow(param_grid2)) {
+  params <- best_params
+  params$subsample <- param_grid2$subsample[i]
+  params$colsample_bytree <- param_grid2$colsample_bytree[i]
+  
+  cv_model <- xgb.cv(
+    params = params,
+    data = xgb_train,
+    nrounds = round(best_iter * 1.2), # Use previous best + margin
+    nfold = 5,
+    early_stopping_rounds = 20,
+    metrics = "logloss",
+    stratified = TRUE,
+    verbose = 0
+  )
+  
+  cv_results2 <- rbind(cv_results2, data.frame(
+    subsample = params$subsample,
+    colsample_bytree = params$colsample_bytree,
+    cv_logloss = cv_model$evaluation_log[cv_model$best_iteration]$test_logloss_mean,
+    best_iter = cv_model$best_iteration
+  ))
+}
+
+# Update best parameters from second round
+best_row <- which.min(cv_results2$cv_logloss)
+best_params$subsample <- cv_results2$subsample[best_row]
+best_params$colsample_bytree <- cv_results2$colsample_bytree[best_row]
+best_iter <- cv_results2$best_iter[best_row]
+
+cat("\nBest parameters after Step 2:\n")
+print(best_params)
+cat("Best number of iterations:", best_iter, "\n")
+
+# Step 3: Tune regularization parameters 
+param_grid3 <- expand.grid(
+  min_child_weight = c(1, 3, 5),
+  gamma = c(0, 0.1, 0.2)
+)
+
+# Third round of tuning
+cv_results3 <- data.frame()
+for (i in 1:nrow(param_grid3)) {
+  params <- best_params
+  params$min_child_weight <- param_grid3$min_child_weight[i]
+  params$gamma <- param_grid3$gamma[i]
+  
+  
+  
+  cv_model <- xgb.cv(
+    params = params,
+    data = xgb_train,
+    nrounds = round(best_iter * 1.2),
+    nfold = 5,
+    early_stopping_rounds = 20,
+    metrics = "logloss",
+    stratified = TRUE,
+    verbose = 0
+  )
+  
+  cv_results3 <- rbind(cv_results3, data.frame(
+    min_child_weight = params$min_child_weight,
+    gamma = params$gamma,
+    cv_logloss = cv_model$evaluation_log[cv_model$best_iteration]$test_logloss_mean,
+    best_iter = cv_model$best_iteration
+  ))
+}
+
+# Update best parameters from third round
+best_row <- which.min(cv_results3$cv_logloss)
+best_params$min_child_weight <- cv_results3$min_child_weight[best_row]
+best_params$gamma <- cv_results3$gamma[best_row]
+best_nrounds <- cv_results3$best_iter[best_row]
+
+cat("\nFinal best parameters:\n")
+print(best_params)
+cat("Final best number of iterations:", best_nrounds, "\n")
+
+# ---- ENSEMBLE XGBOOST WITH OPTIMIZED PARAMETERS ----
+
+# Ensemble XGBoost approach with optimized parameters
+set.seed(114514 )
+n_runs <- 50 # Number of ensemble models
+xgb_preds_list <- vector("list", n_runs)
+
+
+for(i in 1:n_runs){
+
+  
+  # Add small random variations to parameters for ensemble diversity
+  current_params <- best_params
+  current_params$eta <- best_params$eta * runif(1, 0.9, 1.1)
+  current_params$subsample <- min(1, best_params$subsample * runif(1, 0.95, 1.05))
+  current_params$colsample_bytree <- min(1, best_params$colsample_bytree * runif(1, 0.95, 1.05))
+  
+  # Train the XGBoost model with the optimal parameters
+  model <- xgb.train(
+    params = current_params,
+    data = xgb_train,
+    nrounds = best_nrounds,
+    watchlist = list(train = xgb_train, test = xgb_test),
+    verbose = 0
+  )
+  
+  # Get predictions for the test set
+  xgb_preds <- predict(model, xgb_test)
+  xgb_preds_list[[i]] <- xgb_preds
+  
+  # Store the last model for feature importance analysis
+  if(i == n_runs) {
+    xgb_model <- model
+  }
+}
+
+# Average predictions from all ensemble models
+final_xgb_preds <- Reduce("+", xgb_preds_list) / n_runs
+
+# Convert predicted probabilities to class labels using a 0.5 threshold
+final_pred_class <- ifelse(final_xgb_preds > 0.5, "Success", "Failure")
+final_pred_class <- factor(final_pred_class, levels = c("Failure", "Success"))
+
+# Evaluate the final ensemble predictions using the caret package
+conf_matrix <- confusionMatrix(final_pred_class, test_data$feedback)
+roc_obj <- roc(test_data$feedback, final_xgb_preds)
+auc_val <- auc(roc_obj)
+
+# Define evaluate_model function if not already defined
+if (!exists("evaluate_model")) {
+  evaluate_model <- function(pred_probs, actual, model_name) {
+    # Convert probabilities to class predictions
+    pred_class <- ifelse(pred_probs > 0.5, "Success", "Failure")
+    pred_class <- factor(pred_class, levels = levels(actual))
+    
+    # Calculate confusion matrix
+    conf_mat <- confusionMatrix(pred_class, actual)
+    
+    # Calculate ROC and AUC
+    roc_obj <- roc(actual, pred_probs)
+    auc_val <- auc(roc_obj)
+    
+    # Return results
+    list(
+      metrics = data.frame(
+        Model = model_name,
+        Accuracy = conf_mat$overall["Accuracy"],
+        Sensitivity = conf_mat$byClass["Sensitivity"],
+        Specificity = conf_mat$byClass["Specificity"],
+        F1_Score = conf_mat$byClass["F1"],
+        AUC = auc_val
+      ),
+      confusion_matrix = conf_mat,
+      roc = roc_obj,
+      pred_probs = pred_probs,
+      pred_class = pred_class
+    )
+  }
+}
+
+# Create model_results list if not already defined
+if (!exists("model_results")) {
+  model_results <- list()
+}
+
+# Evaluate via the common evaluation function
+xgb_results <- evaluate_model(final_xgb_preds, test_data$feedback, "XGBoost Ensemble")
+model_results[["XGBoost"]] <- xgb_results
+
+# Print ensemble information and feature importance
+cat("\nXGBoost Ensemble Information:\n")
+print(xgb_model)  # Last model from the ensemble
+cat("Ensemble size:", n_runs, "models\n")
+cat("Final Accuracy:", round(xgb_results$metrics$Accuracy, 4), "\n")
+
+# Calculate feature importance
+xgb_importance <- xgb.importance(feature_names = colnames(features), model = xgb_model)
+print(head(xgb_importance, 10))
+
+# If previous model results exist, combine metrics for comparison
+if (exists("log_results") && exists("rf_results")) {
+  all_metrics <- rbind(
+    log_results$metrics,
+    rf_results$metrics,
+    xgb_results$metrics
+  )
+  
+  cat("\nModel Performance Comparison:\n")
+  print(all_metrics)
+} else {
+  cat("\nXGBoost Performance:\n")
+  print(xgb_results$metrics)
+}
+
+# Plot ROC curve for XGBoost
+plot(xgb_results$roc, main = "XGBoost Ensemble ROC Curve", 
+     col = "red", lwd = 2)
+abline(a = 0, b = 1, lty = 2, col = "gray")
+legend("bottomright", legend = paste("AUC =", round(auc_val, 3)), 
+       col = "red", lwd = 2)
+
+# Display confusion matrix
+cat("\nConfusion Matrix:\n")
+print(conf_matrix)
+
+
+```
+
+In the 3 models xgboost ensemble has the highest accuracy of 72.51%, while Random forest is just slightly behind at 72.12%. However, the sensitivity and f1 score of random forest is significantly better. It means that it will detect positive cases more reliably and the prediction for positives are more consistent. And random forest is rather robust and is less likely to be overfitted, which is important in this case. 
+
+
+```{r}
+# Visualization 1: ROC Curves
+# ---- Updated Visualizations for Ensemble XGBoost ----
+
+# Visualization 1: ROC Curves
+roc_plot <- ggplot() +
+  geom_line(aes(x = 1 - log_results$roc$specificities, 
+                y = log_results$roc$sensitivities, 
+                color = "Logistic Regression"), size = 1.2) +
+  geom_line(aes(x = 1 - rf_results$roc$specificities, 
+                y = rf_results$roc$sensitivities, 
+                color = "Random Forest"), size = 1.2) +
+  geom_line(aes(x = 1 - xgb_results$roc$specificities, 
+                y = xgb_results$roc$sensitivities, 
+                color = "XGBoost Ensemble"), size = 1.2) +
+  geom_abline(slope = 1, intercept = 0, linetype = "dashed", color = "gray") +
+  labs(title = "ROC Curve Comparison",
+       x = "False Positive Rate (1 - Specificity)",
+       y = "True Positive Rate (Sensitivity)",
+       color = "Model") +
+  scale_color_manual(values = c("Logistic Regression" = "#FF6B6B", 
+                                "Random Forest" = "#4ECDC4", 
+                                "XGBoost Ensemble" = "#556270")) +
+  theme_minimal() +
+  annotate("text", x = 0.75, y = 0.25, 
+           label = paste("AUC (Log):", round(log_results$metrics$AUC, 3)), 
+           color = "#FF6B6B") +
+  annotate("text", x = 0.75, y = 0.20, 
+           label = paste("AUC (RF):", round(rf_results$metrics$AUC, 3)), 
+           color = "#4ECDC4") +
+  annotate("text", x = 0.75, y = 0.15, 
+           label = paste("AUC (XGB Ens):", round(xgb_results$metrics$AUC, 3)), 
+           color = "#556270")
+
+print(roc_plot)
+
+# Visualization 2: Metrics Comparison
+metrics_long <- all_metrics %>%
+  select(-AUC) %>%  # AUC is plotted separately in the ROC curve
+  pivot_longer(cols = c("Accuracy", "Sensitivity", "Specificity", "F1_Score"),
+               names_to = "Metric", values_to = "Value")
+
+metrics_plot <- ggplot(metrics_long, aes(x = Metric, y = Value, fill = Model)) +
+  geom_bar(stat = "identity", position = "dodge", width = 0.7) +
+  labs(title = "Model Performance Comparison",
+       x = "Metric",
+       y = "Value") +
+  scale_fill_manual(values = c("Logistic Regression" = "#FF6B6B", 
+                               "Random Forest" = "#4ECDC4", 
+                               "XGBoost Ensemble" = "#556270")) +
+  theme_minimal() +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+```
+Model Performance Comparison: this is to compare the 3 models' true Positive Rate (sensitivity) against the False Positive Rate. The AUC summarize the general performance
+```{r,echo = FALSE}
+print(metrics_plot)
+
+# Visualization 3: Feature Importance (Random Forest)
+imp_rf <- randomForest::importance(rf_model)
+imp_df <- data.frame(
+  Feature = rownames(imp_rf),
+  Importance = imp_rf[, "MeanDecreaseGini"]
+) %>%
+  arrange(desc(Importance)) %>%
+  head(10)
+
+rf_imp_plot <- ggplot(imp_df, aes(x = reorder(Feature, Importance), y = Importance)) +
+  geom_bar(stat = "identity", fill = "#4ECDC4") +
+  labs(title = "Top 10 Feature Importance (Random Forest)",
+       x = "Feature",
+       y = "Mean Decrease Gini") +
+  coord_flip() +
+  theme_minimal()
+
+print(rf_imp_plot)
+
+# Visualization 4: Feature Importance (XGBoost Ensemble)
+xgb_imp <- xgb.importance(feature_names = colnames(features), model = xgb_model)
+xgb_imp_df <- as.data.frame(xgb_imp) %>%
+  arrange(desc(Gain)) %>%
+  head(10)
+
+xgb_imp_plot <- ggplot(xgb_imp_df, aes(x = reorder(Feature, Gain), y = Gain)) +
+  geom_bar(stat = "identity", fill = "#556270") +
+  labs(title = "Top 10 Feature Importance (XGBoost Ensemble)",
+       x = "Feature",
+       y = "Gain") +
+  coord_flip() +
+  theme_minimal()
+
+print(xgb_imp_plot)
+
+# Visualization 5: Confusion Matrices
+plot_confusion_matrix <- function(conf_matrix, title) {
+  cm_data <- as.data.frame(conf_matrix$table)
+  
+  ggplot(cm_data, aes(x = Reference, y = Prediction, fill = Freq)) +
+    geom_tile() +
+    geom_text(aes(label = Freq), color = "white", size = 5) +
+    scale_fill_gradient(low = "#4ECDC4", high = "#556270") +
+    labs(title = title,
+         x = "Actual",
+         y = "Predicted") +
+    theme_minimal()
+}
+```
+```{r}
+cm_log <- plot_confusion_matrix(log_results$conf_matrix, "Logistic Regression Confusion Matrix")
+cm_rf <- plot_confusion_matrix(rf_results$conf_matrix, "Random Forest Confusion Matrix")
+cm_xgb <- plot_confusion_matrix(xgb_results$conf_matrix, "XGBoost Ensemble Confusion Matrix")
+
+print(cm_log)
+print(cm_rf)
+print(cm_xgb)
+
+
+```
+These are the confusion matrices for the 3 models. It is the actual vs predicted. It is there to check the True positive and negative, and False positive and negative. 
+```{r}
+# Set working directory and file paths
+test_path <- "C:/Users/windows/Documents/STA/STA141 project/test"
+test_files <- c("test1.rds", "test2.rds")
+
+# Function to preprocess test data in the same way as training data
+preprocess_test_data <- function(test_session) {
+  # Extract basic trial information
+  all_trials <- imap_dfr(test_session$feedback_type, function(feedback, trial_id) {
+    # Create a tibble with basic trial information
+    trial <- tibble(
+      session_id   = 0,  # Placeholder for session_id
+      trial_id     = trial_id,
+      mouse_name   = test_session$mouse_name,
+      contrast_left  = test_session$contrast_left[trial_id],
+      contrast_right = test_session$contrast_right[trial_id],
+      feedback     = feedback,
+      decision_type = case_when(
+        test_session$contrast_left[trial_id] > test_session$contrast_right[trial_id] ~ "left_greater",
+        test_session$contrast_left[trial_id] < test_session$contrast_right[trial_id] ~ "right_greater",
+        test_session$contrast_left[trial_id] == 0 & test_session$contrast_right[trial_id] == 0 ~ "both_zero",
+        TRUE ~ "equal_nonzero"
+      )
+    )
+    
+    # Compute spike statistics
+    spks_trial <- test_session$spks[[trial_id]]
+    total_spikes <- rowSums(spks_trial)
+    
+    trial <- trial %>%
+      mutate(
+        avg_spikes  = mean(total_spikes),
+        med_spikes  = median(total_spikes),
+        max_spikes  = max(total_spikes),
+        spike_var   = var(total_spikes)
+      )
+    
+    # Compute time-based features
+    time_bins <- test_session$time[[trial_id]]
+    if (length(time_bins) >= 2) {
+      mid_idx    <- ceiling(length(time_bins) / 2)
+      early_bins <- 1:mid_idx
+      late_bins  <- (mid_idx + 1):length(time_bins)
+      
+      early_avg <- mean(rowSums(spks_trial[, early_bins, drop = FALSE]))
+      late_avg  <- mean(rowSums(spks_trial[, late_bins, drop = FALSE]))
+      
+      trial <- trial %>%
+        mutate(
+          early_avg     = early_avg,
+          late_avg      = late_avg,
+          response_ratio = early_avg / (late_avg + 1e-10)
+        )
+    } else {
+      trial <- trial %>%
+        mutate(
+          early_avg     = NA_real_,
+          late_avg      = NA_real_,
+          response_ratio = NA_real_
+        )
+    }
+    
+    return(trial)
+  })
+  
+  # Handle factor levels properly
+  all_trials <- all_trials %>%
+    mutate(
+      decision_type = factor(decision_type),
+      mouse_name    = factor(mouse_name),
+      feedback      = factor(feedback, levels = c(-1, 1), labels = c("Failure", "Success"))
+    )
+  
+  return(all_trials)
+}
+
+# Function to evaluate model performance
+evaluate_performance <- function(predictions, actual_values, dataset_name) {
+  # Convert probabilities to class predictions
+  pred_class <- ifelse(predictions > 0.5, "Success", "Failure")
+  pred_class <- factor(pred_class, levels = levels(actual_values))
+  
+  # Calculate confusion matrix
+  conf_mat <- confusionMatrix(pred_class, actual_values)
+  
+  # Calculate ROC and AUC
+  roc_obj <- roc(actual_values, predictions)
+  auc_val <- auc(roc_obj)
+  
+  # Display results
+  cat("\n===== Random Forest Model Performance on", dataset_name, "=====\n")
+  cat("Accuracy:", round(conf_mat$overall["Accuracy"] * 100, 2), "%\n")
+  cat("Sensitivity (True Positive Rate):", round(conf_mat$byClass["Sensitivity"] * 100, 2), "%\n")
+  cat("Specificity (True Negative Rate):", round(conf_mat$byClass["Specificity"] * 100, 2), "%\n")
+  cat("F1 Score:", round(conf_mat$byClass["F1"] * 100, 2), "%\n")
+  cat("AUC:", round(auc_val, 3), "\n")
+  
+  # Print confusion matrix
+  cat("\nConfusion Matrix:\n")
+  print(conf_mat$table)
+  
+  # Return results
+  return(list(
+    metrics = data.frame(
+      Dataset = dataset_name,
+      Accuracy = conf_mat$overall["Accuracy"],
+      Sensitivity = conf_mat$byClass["Sensitivity"],
+      Specificity = conf_mat$byClass["Specificity"],
+      F1_Score = conf_mat$byClass["F1"],
+      AUC = auc_val
+    ),
+    confusion_matrix = conf_mat,
+    roc = roc_obj,
+    predictions = predictions,
+    pred_class = pred_class
+  ))
+}
+
+# Main execution
+cat("===== Random Forest Model Evaluation on Test Datasets =====\n")
+
+# Check if Random Forest model exists in environment
+if (exists("rf_model")) {
+  cat("Using existing Random Forest model in the environment\n")
+} else if (file.exists("rf_model.rds")) {
+  # Try to load from file if exists
+  cat("Loading saved Random Forest model...\n")
+  rf_model <- readRDS("rf_model.rds")
+} else {
+  stop("Error: Random Forest model not found. Please make sure it's either in the environment or saved as 'rf_model.rds'.")
+}
+
+# Process and evaluate each test file
+results_list <- list()
+
+for (i in 1:length(test_files)) {
+  file_path <- file.path(test_path, test_files[i])
+  cat("\nProcessing test file:", test_files[i], "\n")
+  
+  # Load test data
+  test_session <- readRDS(file_path)
+  test_data <- preprocess_test_data(test_session)
+  
+  # Remove any rows with NA values
+  clean_test_data <- na.omit(test_data)
+  cat("Rows after NA removal:", nrow(clean_test_data), "\n")
+  
+  # Verify we have both classes
+  cat("Class distribution:\n")
+  print(table(clean_test_data$feedback))
+  
+  # Prepare data for Random Forest - convert factors to numeric if needed
+  rf_test_data <- clean_test_data
+  if (is.factor(rf_test_data$decision_type)) {
+    rf_test_data$decision_type <- as.numeric(rf_test_data$decision_type)
+  }
+  
+  # Make predictions with Random Forest
+  tryCatch({
+    # Different prediction approach depending on RF package
+    if ("randomForest" %in% class(rf_model)) {
+      # For standard randomForest package
+      rf_pred_prob <- predict(rf_model, rf_test_data, type = "prob")[, "Success"]
+    } else if ("ranger" %in% class(rf_model)) {
+      # For ranger package
+      ranger_pred <- predict(rf_model, data = rf_test_data)
+      rf_pred_prob <- ranger_pred$predictions[, 2]  # Assuming "Success" is the second column
+    } else {
+      # Fall back to basic approach
+      rf_pred_prob <- predict(rf_model, rf_test_data, type = "prob")[, 2]
+    }
+    
+    # Evaluate performance
+    results <- evaluate_performance(rf_pred_prob, clean_test_data$feedback, paste("Test", i))
+    results_list[[i]] <- results
+    
+  }, error = function(e) {
+    cat("Error in prediction:", e$message, "\n")
+    cat("Trying alternative approach...\n")
+    
+    # Alternative approach: Try to match columns exactly
+    if ("randomForest" %in% class(rf_model)) {
+      model_vars <- names(rf_model$forest$ncat)
+    } else if ("ranger" %in% class(rf_model)) {
+      model_vars <- rf_model$forest$independent.variable.names
+    } else {
+      model_vars <- all.vars(terms(rf_model))[-1]  # Exclude response variable
+    }
+    
+    # Find common columns
+    common_cols <- intersect(names(rf_test_data), model_vars)
+    cat("Using", length(common_cols), "common columns for prediction\n")
+    
+    # Subset data to only include common columns
+    rf_test_subset <- rf_test_data[, common_cols, drop=FALSE]
+    
+    # Try again with the subset
+    if ("randomForest" %in% class(rf_model)) {
+      rf_pred_prob <- predict(rf_model, rf_test_subset, type = "prob")[, "Success"]
+    } else if ("ranger" %in% class(rf_model)) {
+      ranger_pred <- predict(rf_model, data = rf_test_subset)
+      rf_pred_prob <- ranger_pred$predictions[, 2]
+    } else {
+      rf_pred_prob <- predict(rf_model, rf_test_subset, type = "prob")[, 2]
+    }
+    
+    # Evaluate performance
+    results <- evaluate_performance(rf_pred_prob, clean_test_data$feedback, paste("Test", i))
+    results_list[[i]] <- results
+  })
+  
+  # Plot ROC curve
+  if (length(unique(clean_test_data$feedback)) >= 2) {
+    plot(results_list[[i]]$roc, main = paste("Random Forest ROC Curve - Test", i), 
+         col = "blue", lwd = 2)
+    abline(a = 0, b = 1, lty = 2, col = "gray")
+    legend("bottomright", legend = paste("AUC =", round(results_list[[i]]$metrics$AUC, 3)), 
+           col = "blue", lwd = 2)
+  }
+}
+
+# Compare results across datasets
+if (length(results_list) > 1) {
+  all_metrics <- do.call(rbind, lapply(results_list, function(x) x$metrics))
+  cat("\n===== Random Forest Performance Comparison =====\n")
+  print(all_metrics)
+  
+  # Check for zero sensitivity issue in Test 2
+  if (all_metrics$Sensitivity[2] == 0) {
+    cat("\nDetected zero sensitivity in Test 2. Investigating prediction probabilities...\n")
+    
+    # Load Test 2 data again
+    test_session <- readRDS(file.path(test_path, test_files[2]))
+    test_data <- preprocess_test_data(test_session)
+    clean_test_data <- na.omit(test_data)
+    rf_test_data <- clean_test_data
+    if (is.factor(rf_test_data$decision_type)) {
+      rf_test_data$decision_type <- as.numeric(rf_test_data$decision_type)
+    }
+    
+    # Get probabilities
+    if ("randomForest" %in% class(rf_model)) {
+      probs <- predict(rf_model, rf_test_data, type = "prob")[, "Success"]
+    } else if ("ranger" %in% class(rf_model)) {
+      probs <- predict(rf_model, data = rf_test_data)$predictions[, 2]
+    } else {
+      probs <- predict(rf_model, rf_test_data, type = "prob")[, 2]
+    }
+    
+    # Check max probability for actual success cases
+    success_idx <- which(clean_test_data$feedback == "Success")
+    if (length(success_idx) > 0) {
+      success_probs <- probs[success_idx]
+      cat("Max probability for 'Success' cases:", max(success_probs), "\n")
+      cat("Mean probability for 'Success' cases:", mean(success_probs), "\n")
+      
+      # Try a lower threshold
+      best_threshold <- 0.5
+      best_sensitivity <- 0
+      
+      for (threshold in seq(0.1, 0.5, by = 0.05)) {
+        pred_class <- ifelse(probs > threshold, "Success", "Failure")
+        pred_class <- factor(pred_class, levels = levels(clean_test_data$feedback))
+        cm <- confusionMatrix(pred_class, clean_test_data$feedback)
+        sensitivity <- cm$byClass["Sensitivity"]
+        
+        cat("Threshold:", threshold, "- Sensitivity:", sensitivity, 
+            "- Specificity:", cm$byClass["Specificity"], "\n")
+        
+        if (sensitivity > best_sensitivity) {
+          best_sensitivity <- sensitivity
+          best_threshold <- threshold
+        }
+      }
+      
+      if (best_threshold != 0.5) {
+        cat("\nRecommended threshold for Test 2:", best_threshold, 
+            "- Sensitivity:", best_sensitivity, "\n")
+      }
+    } else {
+      cat("No 'Success' cases found in Test 2 data.\n")
+    }
+  }
+}
+
+cat("\n===== Random Forest Evaluation Complete =====\n")
+
+```
+ I did all three models to test the prediction, and I kept the best model for the test-Random Forest. The Accuracy is the highest with nearly double the sensitivity. 
+ 
+ 
+Discussion
+In the process of data integration, I kept the NA values after normalizing while setting up the training data. After that I use it on the test data set I saw a huge indent on the ROC curve the a large part of the curve even go under the line. I realized what i did wrong. Later on I omit the NA values it become much better. 
